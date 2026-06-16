@@ -86,6 +86,7 @@ jobs:
   # dependency-CVE gate; container IMAGE CVEs are scanned in reusable-release.yml.
   dependency-scan:
     name: Dependency CVEs (OSV-Scanner)
+    needs: [secret-scan] # fail fast: no point scanning if a secret leaked
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -96,15 +97,51 @@ jobs:
         with:
           working-directory: ${{ inputs.working-directory }}
 
-  # ── Gate 3: SAST + quality gate ──────────────────────────────────────────
-  sast:
-    name: SAST + quality gate (SonarQube CE)
+  # ── Gate 3: Tests + coverage + SAST (one job) ────────────────────────────
+  # Tests run FIRST, in the same job, so the coverage report they emit is on
+  # disk when Sonar runs — Sonar reads it from the shared workspace. Split into
+  # two jobs (as before) Sonar saw no coverage and always reported 0%.
+  # `failed-phase` output tells the DevOps agent which step broke (tests vs
+  # sonar) so it can route to `debug` vs `sonar-heal` — a signal a merged job
+  # would otherwise lose.
+  tests-sonar:
+    name: Tests + coverage + SAST (SonarQube CE)
+    needs: [secret-scan] # fail fast behind the cheap secret gate
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      failed-phase: ${{ steps.phase.outputs.phase }}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      - name: Node tests
+        id: tests-node
+        if: inputs.language == 'node'
+        run: |
+          npm ci
+          npm test --if-present -- --coverage
+
+      - name: Java tests
+        id: tests-java
+        if: inputs.language == 'java'
+        run: ./gradlew test codeCoverageReport
+
+      - name: PHP tests
+        id: tests-php
+        if: inputs.language == 'php'
+        run: |
+          composer install --no-interaction --prefer-dist
+          vendor/bin/phpunit
+
+      # Only scan if tests passed — a failing build has no meaningful coverage,
+      # and routing wants a clean tests-vs-sonar distinction.
       - name: SonarQube scan + quality gate
+        id: sonar
+        if: success()
         uses: jenistenxavier/Open-Source-Summit-India-Demo/.github/actions/sonar-scan@main
         with:
           host-url: ${{ inputs.sonar-host-url }}
@@ -112,6 +149,18 @@ jobs:
           project-key: ${{ inputs.project-key }}
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      # Record which phase failed so the DevOps agent can route correctly.
+      - name: Determine failed phase
+        id: phase
+        if: always()
+        run: |
+          tests="${{ steps.tests-node.outcome }}${{ steps.tests-java.outcome }}${{ steps.tests-php.outcome }}"
+          if [[ "$tests" == *failure* ]]; then
+            echo "phase=tests" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.sonar.outcome }}" != "success" ]; then
+            echo "phase=sonar" >> "$GITHUB_OUTPUT"
+          fi
 
   # ── Container image scanning lives in reusable-release.yml ───────────────
   # NOT a CI gate. CI never builds the releasable image — reusable-release.yml
@@ -123,6 +172,7 @@ jobs:
   # ── Gate 4: SBOM → Dependency-Track ──────────────────────────────────────
   sbom:
     name: SBOM (CycloneDX → Dependency-Track)
+    needs: [secret-scan] # fail fast behind the cheap secret gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -149,36 +199,10 @@ jobs:
           bomFilename: bom.json
           autoCreate: true
 
-  # ── Tests + coverage ─────────────────────────────────────────────────────
-  tests:
-    name: Tests + coverage
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ${{ inputs.working-directory }}
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Node tests
-        if: inputs.language == 'node'
-        run: |
-          npm ci
-          npm test --if-present -- --coverage
-
-      - name: Java tests
-        if: inputs.language == 'java'
-        run: ./gradlew test codeCoverageReport
-
-      - name: PHP tests
-        if: inputs.language == 'php'
-        run: |
-          composer install --no-interaction --prefer-dist
-          vendor/bin/phpunit
-
   # ── Aggregate gate: every gate above must pass ───────────────────────────
   quality-gate:
     name: Quality gate (all checks green)
-    needs: [secret-scan, dependency-scan, sast, sbom, tests]
+    needs: [secret-scan, dependency-scan, tests-sonar, sbom]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All security + quality gates passed — safe to release."
@@ -197,7 +221,7 @@ jobs:
   #   secrets: inherit   (with ANTHROPIC_API_KEY set on the repo/org)
   devops-agent:
     name: DevOps agent
-    needs: [sast, tests, quality-gate]
+    needs: [tests-sonar, quality-gate]
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -211,16 +235,15 @@ jobs:
       - name: Route task
         id: route
         run: |
-          sast='${{ needs.sast.result }}'
-          tests='${{ needs.tests.result }}'
+          phase='${{ needs.tests-sonar.outputs.failed-phase }}'
           gate='${{ needs.quality-gate.result }}'
           task=""; instr=""
-          if [ "$sast" != "success" ]; then
+          if [ "$phase" = "sonar" ]; then
             task="sonar-heal"
             instr="SonarQube quality gate failed for ${{ inputs.project-key }}."
-          elif [ "$tests" != "success" ]; then
+          elif [ "$phase" = "tests" ]; then
             task="debug"
-            instr="Tests job failed. Failed run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}."
+            instr="Tests failed. Failed run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}."
           elif [ "$gate" = "success" ] && [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
             task="version-bump"
           fi
