@@ -70,7 +70,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0   # full history so GitLeaks scans every commit
+          fetch-depth: 0 # full history so GitLeaks scans every commit
       - name: GitLeaks
         uses: gitleaks/gitleaks-action@v3
         env:
@@ -90,7 +90,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0   # full history so OSV diff mode can reach the base ref
+          fetch-depth: 0 # full history so OSV diff mode can reach the base ref
       - name: OSV-Scanner
         uses: jenistenxavier/Open-Source-Summit-India-Demo/.github/actions/osv-scan@main
         with:
@@ -204,7 +204,7 @@ jobs:
       contents: write
       pull-requests: write
     env:
-      AGENT_REPO: jenistenxavier/DevOps-Agent-demo
+      AGENT_REPO: jenistenxavier/DevOps-Agent
       AGENT_REF: main
     steps:
       # 1. Decide the task from the gate results (priority: sonar > debug > bump).
