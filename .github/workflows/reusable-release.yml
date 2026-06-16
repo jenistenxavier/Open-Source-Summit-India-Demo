@@ -1,0 +1,123 @@
+# Reusable release — semantic-release (Conventional Commits) → scan → GHCR.
+#
+#   jobs:
+#     release:
+#       needs: ci
+#       uses: org/platform/.github/workflows/reusable-release.yml@main
+#       with: { image-name: inventory-service }
+#       secrets: inherit
+#
+# Runs only after reusable-ci's gates are green. Versions, tags, builds, scans
+# (Trivy, fail-closed), signs (cosign), and pushes the image to GHCR.
+name: reusable-release
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: GHCR image name (without registry/owner prefix)
+        type: string
+        required: true
+      working-directory:
+        description: Build context / project root
+        type: string
+        required: false
+        default: .
+    outputs:
+      new-release-published:
+        description: "true when semantic-release cut a new version"
+        value: ${{ jobs.release.outputs.published }}
+      new-release-version:
+        description: The version semantic-release produced
+        value: ${{ jobs.release.outputs.version }}
+
+permissions:
+  contents: write     # create tags + GitHub Releases
+  packages: write     # push to GHCR
+  id-token: write     # keyless image signing (cosign)
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      published: ${{ steps.semantic.outputs.new_release_published }}
+      version: ${{ steps.semantic.outputs.new_release_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # ── Version + tag + GitHub Release from Conventional Commits ──────────
+      - name: semantic-release
+        id: semantic
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          extra_plugins: |
+            @semantic-release/commit-analyzer
+            @semantic-release/release-notes-generator
+            @semantic-release/github
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Build → scan → push image to GHCR, tagged with the new version ────
+      # Container scanning lives HERE, not in CI: this is where the actual
+      # deployed artifact is built. Build into the local daemon first, gate on
+      # Trivy (HIGH/CRITICAL OS + base-image CVEs), and push ONLY if it passes
+      # — a vulnerable image never reaches GHCR or cosign. Dependency (lockfile)
+      # CVEs are covered separately by reusable-ci's OSV gate.
+      - name: Log in to GHCR
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 1. Build into the local Docker daemon only (no push yet) so Trivy can
+      #    scan the exact image bytes that will be released.
+      - name: Build image (local, for scan)
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.working-directory }}
+          load: true
+          push: false
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:${{ steps.semantic.outputs.new_release_version }}
+            ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:latest
+
+      # 2. Fail-closed gate: any unfixed-excluded HIGH/CRITICAL aborts the job
+      #    before the push step runs.
+      - name: Trivy (image scan)
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:${{ steps.semantic.outputs.new_release_version }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      # 3. Push only after the scan passes (layer cache → near-instant rebuild).
+      - name: Build + push
+        id: build
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.working-directory }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:${{ steps.semantic.outputs.new_release_version }}
+            ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:latest
+
+      # ── Sign the image (keyless cosign — supply-chain provenance) ─────────
+      - name: Install cosign
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: sigstore/cosign-installer@v3
+      - name: Sign image
+        if: steps.semantic.outputs.new_release_published == 'true'
+        run: cosign sign --yes "ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}@${{ steps.build.outputs.digest }}"

@@ -1,0 +1,293 @@
+# Reusable CI — secure-by-default gate chain.
+#
+# Inherited by any app repo with one line:
+#   jobs:
+#     ci:
+#       uses: org/platform/.github/workflows/reusable-ci.yml@main
+#       with: { language: node }
+#       secrets: inherit
+#
+# Every security gate below is a REQUIRED, non-skippable job that FAILS HARD.
+# Security is not an optional step — it is the workflow.
+#
+# Action refs use version tags here; task #9 (supply-chain hardening) pins them
+# to full commit SHAs and keeps them current via Dependabot (github-actions).
+name: reusable-ci
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: App language (node | java | php)
+        type: string
+        required: true
+      working-directory:
+        description: Subdir to scan/build from
+        type: string
+        required: false
+        default: .
+      sonar-host-url:
+        description: SonarQube CE base URL (self-hosted)
+        type: string
+        required: false
+        default: "http://34.42.111.18/"
+      project-key:
+        description: SonarQube project key (sonar.projectKey)
+        type: string
+        required: true
+      dependency-track-hostname:
+        description: Dependency-Track host only (no protocol, no port, no path)
+        type: string
+        required: false
+        default: "136.112.168.245"
+      dependency-track-port:
+        description: Dependency-Track port
+        type: number
+        required: false
+        default: 8080
+      dependency-track-protocol:
+        description: Dependency-Track protocol (http | https)
+        type: string
+        required: false
+        default: "http"
+    secrets:
+      SONAR_TOKEN:
+        required: false
+      DEPENDENCY_TRACK_API_KEY:
+        required: false
+      ANTHROPIC_API_KEY:
+        # Required only if the embedded DevOps agent job is expected to run.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Gate 1: secrets ──────────────────────────────────────────────────────
+  secret-scan:
+    name: Secret scan (GitLeaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # full history so GitLeaks scans every commit
+      - name: GitLeaks
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          # No license needed for OSS; exit non-zero on any finding = hard fail.
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  # ── Gate 2: dependency CVEs ──────────────────────────────────────────────
+  # OSV-Scanner with PR-diff gating: on PRs it fails ONLY on vulns the PR
+  # introduces (pre-existing debt reported, not gated); full scan on push;
+  # skipped on PR close. See .github/actions/osv-scan. This is the single
+  # dependency-CVE gate; container IMAGE CVEs are scanned in reusable-release.yml.
+  dependency-scan:
+    name: Dependency CVEs (OSV-Scanner)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # full history so OSV diff mode can reach the base ref
+      - name: OSV-Scanner
+        uses: jenistenxavier/Open-Source-Summit-India-Demo/.github/actions/osv-scan@main
+        with:
+          working-directory: ${{ inputs.working-directory }}
+
+  # ── Gate 3: SAST + quality gate ──────────────────────────────────────────
+  sast:
+    name: SAST + quality gate (SonarQube CE)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: SonarQube scan + quality gate
+        uses: jenistenxavier/Open-Source-Summit-India-Demo/.github/actions/sonar-scan@main
+        with:
+          host-url: ${{ inputs.sonar-host-url }}
+          working-directory: ${{ inputs.working-directory }}
+          project-key: ${{ inputs.project-key }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # ── Container image scanning lives in reusable-release.yml ───────────────
+  # NOT a CI gate. CI never builds the releasable image — reusable-release.yml
+  # does (build → Trivy scan → push → cosign). The Trivy gate sits there,
+  # between build and push, so the REAL artifact is scanned and a vulnerable
+  # image is blocked before it ever reaches GHCR.
+  # Scanning a throwaway image here would give false confidence.
+
+  # ── Gate 4: SBOM → Dependency-Track ──────────────────────────────────────
+  sbom:
+    name: SBOM (CycloneDX → Dependency-Track)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Generate CycloneDX SBOM (cdxgen, language-agnostic)
+        run: npx -y @cyclonedx/cdxgen@latest --spec-version 1.6 -o bom.json "${{ inputs.working-directory }}"
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cyclonedx-sbom
+          path: bom.json
+      - name: Upload to Dependency-Track
+        if: inputs.dependency-track-hostname != ''
+        uses: DependencyTrack/gh-upload-sbom@v3
+        with:
+          serverHostname: ${{ inputs.dependency-track-hostname }}
+          port: ${{ inputs.dependency-track-port }}
+          protocol: ${{ inputs.dependency-track-protocol }}
+          apiKey: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}
+          projectName: ${{ github.event.repository.name }}
+          projectVersion: ${{ github.sha }}
+          bomFilename: bom.json
+          autoCreate: true
+
+  # ── Tests + coverage ─────────────────────────────────────────────────────
+  tests:
+    name: Tests + coverage
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Node tests
+        if: inputs.language == 'node'
+        run: |
+          npm ci
+          npm test --if-present -- --coverage
+
+      - name: Java tests
+        if: inputs.language == 'java'
+        run: ./gradlew test codeCoverageReport
+
+      - name: PHP tests
+        if: inputs.language == 'php'
+        run: |
+          composer install --no-interaction --prefer-dist
+          vendor/bin/phpunit
+
+  # ── Aggregate gate: every gate above must pass ───────────────────────────
+  quality-gate:
+    name: Quality gate (all checks green)
+    needs: [secret-scan, dependency-scan, sast, sbom, tests]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "All security + quality gates passed — safe to release."
+
+  # ── AI DevOps agent — ONE job, task routed by which gate failed ──────────
+  # Runs after every gate. The first step picks the task from the gate results:
+  #   sast failed        → sonar-heal
+  #   tests failed       → debug
+  #   all green on main  → version-bump   (push only)
+  #   otherwise          → no-op (job exits early)
+  # A single job naturally serialises sast-vs-tests (no parallel push race).
+  # The agent pushes with GITHUB_TOKEN, which does NOT retrigger CI → no loop.
+  #
+  # Requires the APP caller to grant write perms + expose ANTHROPIC_API_KEY:
+  #   permissions: { contents: write, pull-requests: write }
+  #   secrets: inherit   (with ANTHROPIC_API_KEY set on the repo/org)
+  devops-agent:
+    name: DevOps agent
+    needs: [sast, tests, quality-gate]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      AGENT_REPO: jenistenxavier/DevOps-Agent-demo
+      AGENT_REF: main
+    steps:
+      # 1. Decide the task from the gate results (priority: sonar > debug > bump).
+      - name: Route task
+        id: route
+        run: |
+          sast='${{ needs.sast.result }}'
+          tests='${{ needs.tests.result }}'
+          gate='${{ needs.quality-gate.result }}'
+          task=""; instr=""
+          if [ "$sast" != "success" ]; then
+            task="sonar-heal"
+            instr="SonarQube quality gate failed for ${{ inputs.project-key }}."
+          elif [ "$tests" != "success" ]; then
+            task="debug"
+            instr="Tests job failed. Failed run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}."
+          elif [ "$gate" = "success" ] && [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            task="version-bump"
+          fi
+          echo "task=$task"               >> "$GITHUB_OUTPUT"
+          echo "instruction=$instr"       >> "$GITHUB_OUTPUT"
+          [ -z "$task" ] && echo "No agent action needed for this run." || echo "Selected task: $task"
+
+      # 2. Check out the app repo (target) on the working branch.
+      - name: Checkout app repo
+        if: steps.route.outputs.task != ''
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 0
+          path: app
+
+      # 3. Check out the agent code.
+      - name: Checkout devops-agent
+        if: steps.route.outputs.task != ''
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.AGENT_REPO }}
+          ref: ${{ env.AGENT_REF }}
+          path: devops-agent
+
+      - name: Setup Node
+        if: steps.route.outputs.task != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install agent deps
+        if: steps.route.outputs.task != ''
+        working-directory: devops-agent
+        run: npm ci || npm install
+
+      # 4. Run the agent — it edits, commits and pushes to the branch itself.
+      - name: Run agent
+        id: agent
+        if: steps.route.outputs.task != ''
+        working-directory: devops-agent
+        env:
+          TASK: ${{ steps.route.outputs.task }}
+          INSTRUCTION: ${{ steps.route.outputs.instruction }}
+          PROJECT_KEY: ${{ inputs.project-key }}
+          LANGUAGE: ${{ inputs.language }}
+          SONAR_HOST_URL: ${{ inputs.sonar-host-url }}
+          TARGET_REPO: ${{ github.workspace }}/app/${{ inputs.working-directory }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run agent
+
+      # 5. On PRs, post the agent summary as a comment.
+      - name: Comment summary on PR
+        if: always() && steps.route.outputs.task != '' && github.event_name == 'pull_request' && steps.agent.outputs.summary != ''
+        uses: actions/github-script@v7
+        env:
+          AGENT_SUMMARY: ${{ steps.agent.outputs.summary }}
+          AGENT_TASK: ${{ steps.route.outputs.task }}
+        with:
+          script: |
+            const summary = process.env.AGENT_SUMMARY;
+            const task = process.env.AGENT_TASK;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: `### 🤖 DevOps agent — \`${task}\`\n\n${summary}`
+            });

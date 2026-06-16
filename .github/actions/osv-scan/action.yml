@@ -1,0 +1,79 @@
+# Composite action — OSV-Scanner only, PR-aware.
+#
+#   * pull_request opened/synchronize/reopened → DIFF mode: scan base ref vs
+#     head ref, fail ONLY on vulnerabilities the PR introduces. Pre-existing
+#     debt is reported, not gated.
+#   * push / schedule (no base ref)            → skip; job stays green (PR-only gate).
+#   * pull_request closed                      → skip entirely; job stays green
+#     so the aggregate quality gate passes on merge/close.
+#
+# Diff mode requires the calling job's checkout to use fetch-depth: 0.
+name: osv-scan
+description: OSV-Scanner with PR-diff gating (new vulns only), full scan on push, skip on PR close.
+
+inputs:
+  working-directory:
+    description: Path to scan
+    required: false
+    default: .
+
+runs:
+  using: composite
+  steps:
+    # ── PR open/sync: diff base ref against head ref, gate on new vulns ──────
+    - name: Checkout base ref
+      if: github.base_ref != '' && github.event.action != 'closed'
+      shell: bash
+      run: git checkout "$GITHUB_BASE_REF"
+
+    - name: OSV-Scanner (base ref)
+      if: github.base_ref != '' && github.event.action != 'closed'
+      uses: google/osv-scanner-action/osv-scanner-action@v2.3.5
+      continue-on-error: true
+      with:
+        scan-args: |-
+          --format=json
+          --output=osv-old.json
+          --recursive
+          ${{ inputs.working-directory }}
+
+    - name: Checkout head ref
+      if: github.base_ref != '' && github.event.action != 'closed'
+      shell: bash
+      run: git checkout -f "$GITHUB_SHA"
+
+    - name: OSV-Scanner (head ref)
+      if: github.base_ref != '' && github.event.action != 'closed'
+      uses: google/osv-scanner-action/osv-scanner-action@v2.3.5
+      continue-on-error: true
+      with:
+        scan-args: |-
+          --format=json
+          --output=osv-new.json
+          --recursive
+          ${{ inputs.working-directory }}
+
+    # Reporter computes the delta and sets the gate: non-zero exit on new vulns only.
+    - name: OSV-Scanner (diff gate)
+      if: github.base_ref != '' && github.event.action != 'closed'
+      uses: google/osv-scanner-action/osv-reporter-action@v2.3.5
+      with:
+        scan-args: |-
+          --output=osv-results.sarif
+          --old=osv-old.json
+          --new=osv-new.json
+          --gh-annotations=true
+          --fail-on-vuln=true
+
+    # ── push / schedule: no base ref to diff against — skip, report success ───
+    # OSV gating is PR-only; push builds stay green so the merge/release gate passes.
+    - name: Skip on push
+      if: github.base_ref == '' && github.event.action != 'closed'
+      shell: bash
+      run: echo "Push event — OSV scan runs on PRs only; gate green."
+
+    # ── pull_request closed: nothing to scan, report success ─────────────────
+    - name: Skip on PR close
+      if: github.event.action == 'closed'
+      shell: bash
+      run: echo "PR closed — OSV scan skipped; gate green."

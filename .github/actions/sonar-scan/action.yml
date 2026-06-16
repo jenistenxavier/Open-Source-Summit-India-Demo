@@ -1,0 +1,35 @@
+# Composite action — SonarQube CE analysis + quality-gate enforcement (task #5).
+# Self-hosted SonarQube Community Edition. Fails hard when the quality gate is red.
+name: sonar-scan
+description: Run SonarQube Community Edition analysis and fail the build on quality-gate failure.
+
+inputs:
+  host-url:
+    description: SonarQube CE base URL (self-hosted Docker)
+    required: true
+  working-directory:
+    description: Project root to analyse
+    required: false
+    default: .
+  project-key:
+    description: SonarQube project key (sonar.projectKey)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: SonarQube scan
+      uses: sonarsource/sonarqube-scan-action@v3
+      with:
+        projectBaseDir: ${{ inputs.working-directory }}
+        args: >
+          -Dsonar.projectKey=${{ inputs.project-key }}
+      env:
+        SONAR_HOST_URL: ${{ inputs.host-url }}
+        # SONAR_TOKEN inherited from the calling job's env.
+
+    # Block the pipeline until the gate result is known, then fail if red.
+    - name: Quality gate
+      uses: sonarsource/sonarqube-quality-gate-action@master
+      env:
+        SONAR_HOST_URL: ${{ inputs.host-url }}
